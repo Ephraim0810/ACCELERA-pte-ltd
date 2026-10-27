@@ -105,8 +105,8 @@ test("messages, decisions and verification audit persist across close and reopen
     const input = { ...generateSyntheticCases(1)[0], id: "workflow-1", paymentReference: "WORKFLOW-1" };
     const payment = await db.createPayment(input);
     const message = await db.saveMessage(payment.id, "Please verify the details");
-    assert.equal(message.status, "sent");
-    assert.equal(message.sent, true);
+    assert.equal(message.status, "draft_only");
+    assert.equal(message.sent, false);
     assert.equal((await db.decidePayment(payment.id, "accept", "Reviewed")).workflowStatus, "reviewed");
     assert.equal((await db.verifyPayment(payment.id)).actionRecorded, true);
     await db.close();
@@ -115,8 +115,8 @@ test("messages, decisions and verification audit persist across close and reopen
       const saved = await reopened.getPayment(payment.id);
       assert.equal(saved.workflowStatus, "reviewed");
       assert.equal(saved.messages[0].message, "Please verify the details");
-      assert.equal(saved.messages[0].sent, true);
-      assert.ok(saved.audit.some((item) => item.type === "customer_message_sent" && item.details.messageId === message.id));
+      assert.equal(saved.messages[0].sent, false);
+      assert.ok(saved.audit.some((item) => item.type === "customer_draft_saved" && item.details.messageId === message.id));
       assert.ok(saved.audit.some((item) => item.type === "operator_decision" && item.details.note === "Reviewed"));
       assert.ok(saved.audit.some((item) => item.type === "outcome_verification" && item.details.actionRecorded === true));
     } finally { await reopened.close(); }

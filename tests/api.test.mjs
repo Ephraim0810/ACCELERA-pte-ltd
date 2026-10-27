@@ -27,6 +27,10 @@ async function adminContext(dispatch) {
   return { token: login.body.token };
 }
 
+async function createLegacyPayment(dispatch,input) {
+  return dispatch("POST","/api/payments",input,await adminContext(dispatch));
+}
+
 async function removeTemporaryDir(dir) {
   try {
     await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
@@ -123,7 +127,7 @@ test("API reference documents required fields for posting a case", async (t) => 
 test("payment intake persists and returns an automatic route; all payments include it", async (t) => {
   const dispatch = await withApp(t);
   const input = { ...validCase, paymentReference: "PAY-INTAKE-8821", payeeName: "Apex Industrial Parts Ltd" };
-  const created = await dispatch("POST", "/api/payments", input);
+  const created = await createLegacyPayment(dispatch, input);
   assert.equal(created.status, 201);
   assert.equal(created.body.paymentReference, "PAY-INTAKE-8821");
   assert.equal(created.body.route, "routine");
@@ -135,27 +139,27 @@ test("payment intake persists and returns an automatic route; all payments inclu
 
 test("workflow endpoints require admin session and record a simulated customer update", async (t) => {
   const dispatch = await withApp(t);
-  const created = await dispatch("POST", "/api/payments", { ...validCase, paymentReference: "PAY-AUTH-7788" });
+  const created = await createLegacyPayment(dispatch, { ...validCase, paymentReference: "PAY-AUTH-7788" });
   assert.equal((await dispatch("POST", `/api/payments/${created.body.id}/message`, { message: "We are reviewing your payment." })).status, 401);
   const login = await dispatch("POST", "/api/demo/login", { username: "admin", password: "casepilot" });
   assert.equal(login.status, 200);
   const context = { token: login.body.token };
   const sent = await dispatch("POST", `/api/payments/${created.body.id}/message`, { message: "We are reviewing your payment." }, context);
   assert.equal(sent.status, 201);
-  assert.equal(sent.body.sent, true);
+  assert.equal(sent.body.sent, false);
   const detail = await dispatch("GET", `/api/payments/${created.body.id}`, {}, context);
-  assert.equal(detail.body.messages[0].sent, true);
+  assert.equal(detail.body.messages[0].sent, false);
 });
 
 test("an AI route can be overridden with a reason but hard stops cannot", async (t) => {
   const dispatch = await withApp(t);
-  const flagged = await dispatch("POST", "/api/payments", { ...validCase, paymentReference: "PAY-OVR-8821", paymentStatus: "processing", evidenceQuality: "partial", potentialImpact: "information_only" });
+  const flagged = await createLegacyPayment(dispatch, { ...validCase, paymentReference: "PAY-OVR-8821", paymentStatus: "processing", evidenceQuality: "partial", potentialImpact: "information_only" });
   const login = await dispatch("POST", "/api/demo/login", { username: "admin", password: "casepilot" });
   const context = { token: login.body.token };
   const noReason = await dispatch("POST", `/api/payments/${flagged.body.id}/decision`, { decision: "override", overrideRoute: "routine" }, context);
   assert.equal(noReason.status, 422);
   assert.match(noReason.body.error, /reason/i);
-  const hardStop = await dispatch("POST", "/api/payments", { ...validCase, paymentReference: "PAY-HARD-8821", paymentStatus: "unknown", retryRequested: true });
+  const hardStop = await createLegacyPayment(dispatch, { ...validCase, paymentReference: "PAY-HARD-8821", paymentStatus: "unknown", retryRequested: true });
   const blocked = await dispatch("POST", `/api/payments/${hardStop.body.id}/decision`, { decision: "override", overrideRoute: "routine", overrideReason: "Checked" }, context);
   assert.equal(blocked.status, 422);
   assert.match(blocked.body.error, /hard stops/i);
@@ -164,22 +168,24 @@ test("an AI route can be overridden with a reason but hard stops cannot", async 
 test("payment queue and details are restricted to the admin session", async (t) => {
   const dispatch = await withApp(t);
   assert.equal((await dispatch("GET", "/api/payments")).status, 401);
-  const payment = await dispatch("POST", "/api/payments", { ...validCase, paymentReference: "PAY-SEC-001" });
+  const payment = await createLegacyPayment(dispatch, { ...validCase, paymentReference: "PAY-SEC-001" });
   assert.equal((await dispatch("GET", `/api/payments/${payment.body.id}`)).status, 401);
 });
 
 test("AI can recommend escalation above the policy floor", async (t) => {
   const dispatch = await withApp(t, { analyzer: async () => ({ provider: "test-model", riskRecommendation: "high", confidence: 0.93, summary: "Evidence indicates a high risk." }) });
-  const payment = await dispatch("POST", "/api/payments", { ...validCase, paymentReference: "PAY-AI-HIGH-001" });
-  assert.equal(payment.body.recommendation.aiRoute, "escalate");
-  assert.equal(payment.body.route, "escalate");
-  assert.equal(payment.body.recommendation.policyFloor, "routine");
-  assert.equal(payment.body.workflowStatus, "pending");
+  const payment = await createLegacyPayment(dispatch, { ...validCase, paymentReference: "PAY-AI-HIGH-001" });
+  const context = await adminContext(dispatch);
+  const analysis = await dispatch("POST", `/api/payments/${payment.body.id}/analyze`, {}, context);
+  assert.equal(analysis.body.recommendation.aiRoute, "escalate");
+  assert.equal(analysis.body.route, "escalate");
+  assert.equal(analysis.body.recommendation.policyFloor, "routine");
+  assert.equal(analysis.body.workflowStatus, "pending");
 });
 
 test("admin override records the selected route and verification finds the recorded outcome", async (t) => {
   const dispatch = await withApp(t);
-  const payment = await dispatch("POST", "/api/payments", { ...validCase, paymentReference: "PAY-OVERRIDE-001" });
+  const payment = await createLegacyPayment(dispatch, { ...validCase, paymentReference: "PAY-OVERRIDE-001" });
   const login = await dispatch("POST", "/api/demo/login", { username: "admin", password: "casepilot" });
   const context = { token: login.body.token };
   const result = await dispatch("POST", `/api/payments/${payment.body.id}/decision`, { decision: "override", overrideRoute: "human_review", overrideReason: "Reviewer found a supporting document not present in the initial record." }, context);
@@ -203,17 +209,17 @@ test("legacy case reads and actions require the admin session", async (t) => {
 test("payment assessment is derived from beneficiary records, not client-supplied risk labels", async (t) => {
   const dispatch=await withApp(t);
   const good={customerName:"Northstar Supplies Pte Ltd",payeeName:"Apex Industrial Parts Pte Ltd",beneficiaryAccount:"0123456789",bankCountry:"Singapore",paymentReference:"PMT-GOOD-001",amount:4800,currency:"SGD",rail:"GIRO",purpose:"October parts invoice"};
-  const routine=await dispatch("POST","/api/payments",good);
+  const routine=await createLegacyPayment(dispatch,good);
   assert.equal(routine.status,201); assert.equal(routine.body.route,"routine");
-  const unregistered=await dispatch("POST","/api/payments",{...good,paymentReference:"PMT-NEW-001",beneficiaryAccount:"8765432109",payeeName:"New Parts Supplier",identityConcern:"none",potentialImpact:"information_only",evidenceQuality:"complete",route:"routine",riskRecommendation:"low"});
+  const unregistered=await createLegacyPayment(dispatch,{...good,paymentReference:"PMT-NEW-001",beneficiaryAccount:"8765432109",payeeName:"New Parts Supplier",identityConcern:"none",potentialImpact:"information_only",evidenceQuality:"complete",route:"routine",riskRecommendation:"low"});
   assert.equal(unregistered.status,201); assert.equal(unregistered.body.route,"human_review");
-  const mismatch=await dispatch("POST","/api/payments",{...good,paymentReference:"PMT-MISMATCH-001",payeeName:"Different Company Ltd"});
+  const mismatch=await createLegacyPayment(dispatch,{...good,paymentReference:"PMT-MISMATCH-001",payeeName:"Different Company Ltd"});
   assert.equal(mismatch.status,201); assert.equal(mismatch.body.route,"escalate"); assert.ok(mismatch.body.case.triage.hardStops.length);
 });
 
 test("beneficiary country mismatch escalates from stored account evidence", async (t) => {
   const dispatch=await withApp(t);const input={customerName:"Northstar Supplies Pte Ltd",payeeName:"Apex Industrial Parts Pte Ltd",beneficiaryAccount:"0123456789",bankCountry:"Malaysia",paymentReference:"PMT-COUNTRY-001",amount:4800,currency:"SGD",rail:"SWIFT",purpose:"October invoice"};
-  const created=await dispatch("POST","/api/payments",input);assert.equal(created.body.route,"escalate");assert.ok(created.body.case.triage.hardStops.length);
+  const created=await createLegacyPayment(dispatch,input);assert.equal(created.body.route,"escalate");assert.ok(created.body.case.triage.hardStops.length);
 });
 
 
@@ -230,7 +236,7 @@ test("server initialization awaits seed before reporting persistent counts", asy
 
 test("payment updates are visible on subsequent reads and list responses", async (t) => {
   const dispatch = await withApp(t);
-  const created = await dispatch("POST", "/api/payments", { ...validCase, paymentReference: "ASYNC-WRITE-001" });
+  const created = await createLegacyPayment(dispatch, { ...validCase, paymentReference: "ASYNC-WRITE-001" });
   assert.equal(created.status, 201);
   const context = await adminContext(dispatch);
   const decided = await dispatch("POST", `/api/payments/${created.body.id}/decision`, { decision: "accept", note: "Reviewed" }, context);
@@ -290,7 +296,7 @@ test("database rejection during a decision does not expose connection details", 
   const dir = mkdtempSync(join(tmpdir(), "casepilot-decision-error-"));
   const app = await createCasePilotServer({ dbPath: join(dir, "decision.sqlite"), env: {} });
   t.after(async () => { await new Promise((resolve) => app.server.close(resolve)); await app.close(); await removeTemporaryDir(dir); });
-  const created = await app.dispatch("POST", "/api/payments", { ...validCase, paymentReference: "ASYNC-ERROR-001" });
+  const created = await createLegacyPayment(app.dispatch, { ...validCase, paymentReference: "ASYNC-ERROR-001" });
   const { token } = await adminContext(app.dispatch);
   app.db.decidePayment = async () => { throw new Error("libsql://private-db.turso.io?authToken=secret-decision-token"); };
   await new Promise((resolve) => app.server.listen(0, "127.0.0.1", resolve));
@@ -307,7 +313,7 @@ test("payment workflow and audit history persist across a database reopen", asyn
   let app = await createCasePilotServer({ dbPath, env: {} });
   t.after(async () => { await app?.close(); await removeTemporaryDir(dir); });
 
-  const created = await app.dispatch("POST", "/api/payments", {
+  const created = await createLegacyPayment(app.dispatch, {
     ...validCase,
     paymentReference: "PERSIST-WORKFLOW-001",
     payeeName: "Apex Industrial Parts Ltd",
@@ -318,12 +324,12 @@ test("payment workflow and audit history persist across a database reopen", asyn
   const context = { token: login.body.token };
   const message = await app.dispatch("POST", `/api/payments/${created.body.id}/message`, { message: "Your payment review is complete." }, context);
   assert.equal(message.status, 201);
-  const decision = await app.dispatch("POST", `/api/payments/${created.body.id}/decision`, { decision: "close", note: "Confirmed against recorded evidence." }, context);
+  const decision = await app.dispatch("POST", `/api/payments/${created.body.id}/decision`, { decision: "accept", note: "Reviewed evidence; outcome still needs verification." }, context);
   assert.equal(decision.status, 200);
-  assert.equal(decision.body.workflowStatus, "closed");
+  assert.equal(decision.body.workflowStatus, "reviewed");
   const verification = await app.dispatch("POST", `/api/payments/${created.body.id}/verify`, {}, context);
   assert.equal(verification.status, 200);
-  assert.equal(verification.body.verified, true);
+  assert.equal(verification.body.verified, false);
   const paymentId = created.body.id;
   await app.close();
 
@@ -331,7 +337,7 @@ test("payment workflow and audit history persist across a database reopen", asyn
   const reopenedLogin = await app.dispatch("POST", "/api/demo/login", { username: "admin", password: "casepilot" });
   const reopened = await app.dispatch("GET", `/api/payments/${paymentId}`, {}, { token: reopenedLogin.body.token });
   assert.equal(reopened.status, 200);
-  assert.equal(reopened.body.workflowStatus, "closed");
+  assert.equal(reopened.body.workflowStatus, "reviewed");
   assert.equal(reopened.body.messages[0].message, "Your payment review is complete.");
   assert.ok(reopened.body.audit.some((event) => event.type === "operator_decision"));
   assert.ok(reopened.body.audit.some((event) => event.type === "outcome_verification"));

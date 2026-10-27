@@ -79,6 +79,7 @@ export async function analyzeCase(caseRecord, env = process.env) {
     identityConcern: caseRecord.identityConcern,
     retryRequested: caseRecord.retryRequested,
     authoritativeConflict: caseRecord.authoritativeConflict,
+    workflowEvidence: caseRecord.workflowEvidence || null,
     verifiedTimeline: (caseRecord.events || []).map(({ title, detail, verified }) => ({ title, detail, verified })),
   };
   const prompt = [

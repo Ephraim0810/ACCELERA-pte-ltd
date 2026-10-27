@@ -1,87 +1,66 @@
-# CasePilot
+# Accelera
+**From an operational exception to a verified outcome.**
 
-**Investigate clearly. Resolve with confidence.**
+A guided student prototype for OCBC IGNITE Problem Statement 2, by The 4th Dimension. Accelera connects investigation, permission checks, a defined mock update and read-back verification.
 
-CasePilot is a student-built payment-operations prototype. It demonstrates payment intake, exception assessment, operations review, customer communication, and outcome tracking. For the school presentation, explain that payment records and customer updates are synthetic: the app does not connect to OCBC, move money, or send real SMS.
+All records, confirmations, mandates, invoices and organisations are fictional. No money moves, no live bank system is connected, and no customer message is sent.
 
-## Run locally
+## Open the prototype
+1. Use Node.js **22.5 or newer**.
+2. On Windows, double-click **START_ACCELERA.bat**. It installs the existing dependencies if needed, starts the local app and opens the browser.
+3. Choose **Open workspace**. The local demonstration credentials are prefilled: username **admin**, password **casepilot**. The original local password is retained for compatibility; the product is Accelera.
 
-Requires Node.js 22.5 or newer. Install dependencies once, then start the app:
+Or run from this folder:
 
-```powershell
+~~~sh
 npm ci
 npm test
 npm start
-```
+~~~
 
-Open `http://127.0.0.1:4174/` for login, `/payment` for payment intake, `/transactions` for the payment queue, and `/admin` for administration. On Windows, `START_CASEPILOT.bat` starts the local server.
+Open **http://127.0.0.1:4174**. Use the guide inside the app whenever you need an explanation.
 
-The first start inserts 120 fictional seed records idempotently. Local records are stored in `data/casepilot.sqlite`. If `DATABASE_URL` and `TURSO_AUTH_TOKEN` are both configured, the server instead uses the hosted libSQL/Turso database.
+## Explore the complete workflow
+The Overview offers six main synthetic journeys and four additional failure fixtures.
 
-Copy `.env.example` to `.env` for local configuration. `GROQ_API_KEY` is optional; without it the app uses deterministic fallback analysis. Local demo login defaults to `admin` / `casepilot`; change these values before sharing the local app. `.env` is ignored by Git.
+- **A payment recorded correctly:** standard field/reference validation passes; the instruction is saved. No exception investigation or model call runs. Recording does not prove settlement.
+- **Stale enquiry status:** match the final mock confirmation to the original instruction, update only the internal enquiry and verify its saved result.
+- **Missing confirmation:** record a specific evidence request and keep the case open. A clearly labelled simulator supplies matching evidence so the case can resume.
+- **Existing authorised allocation:** recover the original SGD 2,000 + SGD 500 invoice split. Exact mandate, recovery delegation, current balances and reviewer approval are required.
+- **Conflicting records:** preserve the evidence and remaining question for a person.
+- **False acknowledgement:** the mock service acknowledges but the target stays unchanged. Read-back fails and prevents closure or a blind retry.
 
-## Hosted deployment
+Advanced fixtures cover a missing mandate, an already-applied allocation, a mismatched confirmation and an in-flight attempt.
 
-Deployment has **not** been published yet. It needs a Git repository connected to Render and Netlify, plus your Turso account/database and server secrets. The project includes `render.yaml`, `netlify.toml`, and a build script for Netlify's same-origin `/api/*` proxy.
+**Run controlled workflow** investigates and completes an eligible case automatically. It pauses at missing evidence, a model concern or required approval. **Guide me step by step** exposes each stage for explanation. After approval, apply the permitted update and read back the result.
 
-1. Put the project in a Git repository connected to your Render and Netlify accounts. Do not commit `.env`, database files, or tokens.
-2. Create a Turso database, then obtain its URL and database token. With the Turso CLI, the relevant commands are:
+The payment form is a recording simulator, not a bank payment page. Use fictional details only. Unknown beneficiaries are described as missing reference evidence, not as proven conflicts.
 
-   ```sh
-   turso db create casepilot
-   turso db show casepilot --url
-   turso db tokens create casepilot
-   ```
+## What is implemented
+- Consistent Accelera interface, contextual guides, meaningful next actions and readable evidence cards.
+- Complete paginated queue loading, urgency/state ordering and oldest-first ordering within a state; search and filters.
+- Separate payment recording, operational case state and read-back verification.
+- Persisted structured evidence, exact action authority, proposal fingerprints, approval, attempts and outcomes.
+- Transactional action checks and serialized local writes; successful repeats do not apply the target twice.
+- Waiting/resume, human ownership, unsent evidence-request drafts and an explanatory event log.
+- Actual guided-record outcome counts. Observed resolution durations include user clicks and waiting; no bank baseline or savings percentage is claimed.
+- Five explanatory role views: System, Agent, Reviewer, Administrator and Process Owner. One demo operator session can explore all responsibilities; this is not production RBAC or separation of duties.
 
-   Use the printed URL as Render's `DATABASE_URL` and the token as `TURSO_AUTH_TOKEN`. Keep the token private.
-3. In Render, create a Blueprint from the repository's `render.yaml`. Supply the prompted secret values. Set `DEMO_ADMIN_USER` and a strong, unique `DEMO_ADMIN_PASSWORD`. Add `GROQ_API_KEY` only if you want live model analysis; rotate the previously shared Groq key before using it on a public service. After the API deploy succeeds, copy its `https://<service>.onrender.com` URL.
-4. In Netlify, import the same Git repository. The checked-in `netlify.toml` runs `node scripts/build-netlify.mjs` and publishes `public/`. Add `RENDER_API_URL` as a **build-time public origin**, using the Render service origin only (for example `https://casepilot-api.onrender.com`, with no path). Trigger a deploy.
-5. Visit the Netlify URL, create a synthetic payment, log in with the Render admin credentials, and check that the payment and workflow remain after the API service restarts.
+The source and target records are mock data in the same database. Verification reloads saved state in a separate transaction; it is not independent confirmation from an external bank or processor.
 
-Only `RENDER_API_URL` belongs in Netlify; it is public by design. Put the Turso URL/token, admin username/password, and optional Groq key in Render's server environment. Never use the local default password on a public deployment. The public prototype still does not use real bank payment rails or send customer messages.
+## Optional AI
+The app works without any key, using a clearly labelled deterministic walkthrough. For advisory model investigation, copy .env.example to .env and configure GROQ_API_KEY on the server. Never place it in browser code or commit it.
 
-The service may be unavailable briefly during a free-tier spin-down or restart. Check the providers' current plans and limits before choosing any paid options.
+The fixed model destination is Groq's HTTPS chat-completions endpoint. A failed or unusable response falls back to deterministic evidence checks. The UI does not claim a live AI result when fallback was used. AI cannot create authority, bypass controls or declare an unverified result successful.
 
-## Walkthrough
+## Local data and configuration
+Ordinary npm startup uses a local SQLite-compatible file at data/casepilot.sqlite relative to this project folder. The internal filename and compatibility server export are retained from the original demo. Runtime files and private .env are excluded from the source package.
 
-1. Create a payment at `/payment`. Try a registered beneficiary for a routine payment, an unknown account for human review, or a registered account with a mismatched name for escalation.
-2. Note the generated payment reference and assessment.
-3. Sign in using the admin credentials configured for the current environment.
-4. Filter the payment queue, inspect the recommendation, evidence, policy route, and hard stops.
-5. Record a customer update, choose a workflow decision, and verify the outcome. The message is saved as a workflow record; it is not sent to a phone.
+PORT defaults to 4174 and local HOST defaults to 127.0.0.1. Hosted database settings are used by the main server only when NODE_ENV=production. Existing Render/Netlify scaffolding is retained; it is not deployed by starting the local prototype. Production startup requires remote database configuration and explicit nondefault operator credentials.
 
-## AI and decision controls
+To stop a launcher-started server, stop the Node process belonging to this project. Do not stop unrelated Node applications.
 
-If `GROQ_API_KEY` is configured on the server, CasePilot sends structured investigation requests to Groq. The default model is `openai/gpt-oss-20b`; change it with `AI_MODEL`. Without a key, deterministic evidence heuristics remain available. The model can recommend a route, but deterministic policy controls the minimum required route.
+## Verification and scope
+Run npm test for automated workflow, input, persistence, HTTP-boundary and compatibility regressions. Browser checks cover normal recording, controlled status resolution, evidence waiting/resume, approval and failed verification.
 
-The backend scores payment status, evidence quality, potential impact, and authority concern. Human review means an operations employee assesses the case. Escalation routes a serious or blocked case to a specialist or higher-authority reviewer. Both involve a person. An admin override requires a reason, and active safety hard stops cannot be overridden. These controls are prototype behavior, not OCBC's internal policy.
-
-## Data and APIs
-
-The app uses SQLite-compatible SQL. Locally it writes to a file; in hosted mode it connects to Turso using libSQL. Stored records include payments, linked cases, risk recommendations, events, customer-message records, decisions, and audit history.
-
-- `POST /api/payments`: create and automatically assess a payment; public intake route.
-- `GET /api/payments`: list and filter payments after admin login.
-- `GET /api/payments/{id}`: retrieve payment and case history after login.
-- `POST /api/payments/{id}/analyze`: rerun advisory analysis (admin).
-- `POST /api/payments/{id}/message`: record a customer update (admin; no SMS sent).
-- `POST /api/payments/{id}/decision`: record a review or audited override (admin).
-- `POST /api/payments/{id}/verify`: verify and log workflow outcome (admin).
-- Legacy case endpoints remain under `/api/cases`; API reference: `/api/docs`.
-- `GET /api/health`: API/database readiness and synthetic seed counts.
-
-## Environment variables
-
-| Variable | Where | Purpose |
-| --- | --- | --- |
-| `DATABASE_URL` | Render secret | Turso/libSQL database URL. Leave unset locally to use file storage. |
-| `TURSO_AUTH_TOKEN` | Render secret | Private token for the hosted database. |
-| `DEMO_ADMIN_USER` | Render secret / local `.env` | Admin login name. |
-| `DEMO_ADMIN_PASSWORD` | Render secret / local `.env` | Admin login password; hosted mode rejects the known demo default. |
-| `GROQ_API_KEY` | Render secret / local `.env` | Optional server-only Groq key. |
-| `AI_PROVIDER` | Render or local `.env` | Model provider; default `groq`. |
-| `AI_MODEL` | Render or local `.env` | Model identifier; default `openai/gpt-oss-20b`. |
-| `PORT` | Local `.env` / hosting platform | Server port; defaults to `4174` locally. |
-| `RENDER_API_URL` | Netlify build environment | Public Render origin used to generate the `/api/*` proxy rule. |
-
-The seeded data is fictional; it is not an OCBC dataset, a real model-training set, or evidence of measured bank performance.
+This is a working synthetic prototype, not a claim of production readiness, a security guarantee, demonstrated OCBC savings or guaranteed competition results.

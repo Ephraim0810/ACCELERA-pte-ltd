@@ -1,0 +1,1 @@
+import {$$,brand} from "/shared.js"; $$("[data-brand]").forEach(x=>x.innerHTML=brand);

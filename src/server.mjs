@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createDatabase } from "./db.mjs";
 import { generateSyntheticCases, exceptionTypes } from "./seed.mjs";
 import { computeTriage, recommendRoute } from "./policy.mjs";
+import { SCENARIOS } from "./workflow.mjs";
 import { analyzeCase, fallbackAnalysisForCase, makeCustomerDraft, validateCaseInput } from "./ai.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -24,7 +25,10 @@ async function readJson(request) {
     body += chunk;
     if (Buffer.byteLength(body) > MAX_BODY_BYTES) throw Object.assign(new Error("Request body is too large."), { status: 413 });
   }
-  try { return JSON.parse(body || "{}"); } catch { throw Object.assign(new Error("Request body must be valid JSON."), { status: 400 }); }
+  let parsed;
+  try { parsed=JSON.parse(body || "{}"); } catch { throw Object.assign(new Error("Request body must be valid JSON."), {status:400}); }
+  if(!parsed||typeof parsed!=="object"||Array.isArray(parsed))throw Object.assign(new Error("Request body must be a JSON object."), {status:422});
+  return parsed;
 }
 function secureHeaders(response) {
   response.setHeader("x-content-type-options", "nosniff");
@@ -32,7 +36,7 @@ function secureHeaders(response) {
   response.setHeader("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
 }
 export function resolvePageAsset(pathname) {
-  const files = { "/": "login.html", "/payment": "payment.html", "/payment.html": "payment.html", "/login": "login.html", "/transactions": "transactions.html", "/admin": "admin.html", "/styles.css": "styles.css", "/app.js": "app.js", "/payment.js": "payment.js", "/login.js": "login.js", "/admin.js": "admin.js", "/management.js": "management.js" };
+  const files = { "/": "login.html", "/payment": "payment.html", "/payment.html": "payment.html", "/login": "login.html", "/transactions": "transactions.html", "/admin": "admin.html", "/styles.css": "styles.css", "/app.js": "app.js", "/payment.js": "payment.js", "/login.js": "login.js", "/admin.js": "admin.js", "/management.js": "management.js", "/workspace.js": "workspace.js", "/shared.js": "shared.js", "/accelera.css": "accelera.css", "/guide.js": "guide.js", "/guide": "guide.html", "/overview": "index.html" };
   return files[pathname] || null;
 }
 async function serveAsset(pathname, response) {
@@ -83,7 +87,7 @@ function openApiDocument() {
   const paymentSubmission = { type: "object", required: ["customerName","payeeName","beneficiaryAccount","bankCountry","paymentReference","amount","currency","rail","purpose"], properties: { customerName: {type:"string",minLength:2,maxLength:120}, payeeName:{type:"string",minLength:2,maxLength:120}, beneficiaryAccount:{type:"string",pattern:"^[0-9]{8,18}$"}, bankCountry:{type:"string",minLength:2,maxLength:120}, paymentReference:{type:"string",minLength:2,maxLength:40}, amount:{type:"number",exclusiveMinimum:0,maximum:100000000}, currency:{type:"string",pattern:"^[A-Z]{3}$"}, rail:{type:"string",enum:["GIRO","FAST","MEPS","SWIFT"]}, purpose:{type:"string",minLength:2,maxLength:120} } };
   return {
     openapi: "3.1.0",
-    info: { title: "CasePilot Synthetic Payment Exception API", version: "1.0.0", description: "Synthetic-only demo API. No live banking or customer actions." },
+    info: { title: "Accelera Synthetic Payment Exception API", version: "1.0.0", description: "Synthetic-only demo API. No live banking or customer actions." },
     servers: [{ url: "/" }],
     paths: {
       "/api/demo/login": { post: { summary: "Sign in to the operations workspace", responses: { "200": ok, "401": bad } } },
@@ -127,6 +131,7 @@ function validatePaymentSubmission(body, exceptionTypes) {
   if (!/^[0-9]{8,18}$/.test(body.beneficiaryAccount.replace(/\s/g,""))) return { error: "Enter a beneficiary account number between 8 and 18 digits." };
   if (!/^(GIRO|FAST|MEPS|SWIFT)$/i.test(body.rail)) return { error: "Payment method is invalid." };
   if (body.paymentReference.trim().length > 40 || body.payeeName.trim().length > 120) return { error: "Payment reference or beneficiary name is too long." };
+  if (Math.abs(body.amount*100-Math.round(body.amount*100))>0.000001 || !Number.isSafeInteger(Math.round(body.amount*100))) return {error:"Use an amount with no more than two decimal places."};
   const account=body.beneficiaryAccount.replace(/\s/g,""); const known=knownBeneficiaries[account];
   const norm=value=>String(value||"").toLowerCase().replace(/[^a-z0-9]/g,"");
   const matched=Boolean(known && norm(known.name)===norm(body.payeeName));
@@ -156,11 +161,63 @@ export function createApiDispatcher({ db, env = process.env, analyzer, sessions 
     }
     if (method === 'GET' && pathname === '/api/demo/session') return { status: 200, body: { authenticated: isAdmin, user: isAdmin ? sessions.get(token) : null } };
     if (method === 'POST' && pathname === '/api/demo/logout') { sessions.delete(token); return { status: 200, body: { ok: true } }; }
+    if (pathname === "/api/demo/scenarios" && method === "GET") return {status:200,body:SCENARIOS};
+    if (method === "POST" && pathname.startsWith("/api/demo/scenarios/")) {
+      if(!isAdmin)return {status:401,body:{error:"Operations sign-in required."}};
+      const key=pathname.split("/").at(-1);
+      if(!Object.hasOwn(SCENARIOS,key))return {status:422,body:{error:"Unknown synthetic scenario."}};
+      return dispatch("POST","/api/payments",{
+        customerName:"Northstar Supplies Pte Ltd",payeeName:key==="conflict"?"Different Parts Company":"Apex Industrial Parts Pte Ltd",
+        beneficiaryAccount:"0123456789",bankCountry:"Singapore",paymentReference:"ACC-"+key.toUpperCase().replaceAll("_","-")+"-"+randomUUID().slice(0,6).toUpperCase(),
+        amount:2500,currency:"SGD",rail:"FAST",purpose:"Synthetic supplier invoice payment",demoScenario:key
+      },{...context,scenarioAuthorised:true});
+    }
+    if (pathname === "/api/workflow/metrics" && method === "GET") return isAdmin?{status:200,body:await db.workflowMetrics()}:{status:401,body:{error:"Operations sign-in required."}};
+    const wm=pathname.match(/^\/api\/payments\/([^/]+)\/workflow$/);
+    if(wm){
+      if(!isAdmin)return {status:401,body:{error:"Operations sign-in required."}};
+      const payment=await db.getPayment(wm[1]);
+      if(!payment)return {status:404,body:{error:"Payment not found."}};
+      if(method==="GET")return {status:200,body:{payment,workflow:payment.workflow}};
+      if(method!=="POST")return {status:405,body:{error:"Method not allowed."}};
+      const allowed=["run_case","investigate","execute","verify","approve","request_evidence","receive_evidence","takeover"];
+      if(!body||!allowed.includes(body.action))return {status:422,body:{error:"Choose a supported workflow action."}};
+      let model=null;
+      if(["investigate","run_case"].includes(body.action)&&payment.workflow?.investigationRequired){
+        const current={...payment.case,workflowEvidence:payment.workflow.source};
+        if(payment.workflow.profile==="status"){
+          const confirmed=Boolean(payment.workflow.source.confirmation);
+          Object.assign(current,{paymentStatus:confirmed?"confirmed":"unknown",evidenceQuality:confirmed?"complete":"partial",authoritativeConflict:payment.workflow.source.conflict,evidenceSummary:confirmed?"A final synthetic confirmation is now available. Check its exact binding and current authority before the internal enquiry update.":"Final synthetic confirmation is missing. A timeout is not proof of failure; keep the case open."});
+        }
+        current.triage=computeTriage(current);
+        try{model=await runAnalysis(current)}catch{model=fallbackAnalysisForCase(current)}
+        if(!model||typeof model!=="object")model=fallbackAnalysisForCase(current);
+      }
+      try{
+        let result=await db.applyWorkflow(payment.id,body.action==="run_case"?"investigate":body.action,{note:typeof body.note==="string"?body.note.slice(0,500):"",analysis:model});
+        if(body.action==="run_case"&&result.workflow.status==="ready"){
+          result=await db.applyWorkflow(payment.id,"execute");
+          if(result.workflow.status==="executed")result=await db.applyWorkflow(payment.id,"verify");
+        }
+        if(model)await db.saveAnalysis(payment.case.id,model.provider||"demo_fallback",model,payment.case.triage);
+        return {status:200,body:{payment:await db.getPayment(payment.id),workflow:result.workflow}};
+      }catch(error){if(error.status)return {status:error.status,body:{error:error.message}};throw error;}
+    }
     if (method === 'POST' && pathname === '/api/payments') {
+      if(body?.exceptionType!==undefined&&!isAdmin)return {status:401,body:{error:'Operations sign-in is required to create a legacy synthetic fixture.'}};
       let validated; try { validated = validatePaymentSubmission(body, exceptionTypes); } catch (error) { return { status: 422, body: { error: error.message } }; }
       if (validated.error) return { status: 422, body: { error: validated.error } };
+      if(body.demoScenario!==undefined&&!context.scenarioAuthorised)return {status:422,body:{error:"Use the signed-in synthetic scenario controls."}};
+      if(context.scenarioAuthorised){
+        const key=body.demoScenario;validated.value.demoScenario=key;
+        if(["status","false_ack","mismatched_confirmation","in_flight","allocation","missing_mandate","already_applied"].includes(key))Object.assign(validated.value,{paymentStatus:"confirmed",exceptionType:"status_mismatch",evidenceQuality:"complete",potentialImpact:"information_only",identityConcern:"none",authoritativeConflict:false,evidenceSummary:"The internal enquiry is pending. Structured mock source records are available for investigation."});
+        if(key==="waiting")Object.assign(validated.value,{paymentStatus:"unknown",exceptionType:"status_timeout",evidenceQuality:"partial",potentialImpact:"reversible_update",identityConcern:"none",evidenceSummary:"The processor request timed out. Final authoritative confirmation is missing; a timeout does not prove failure."});
+      }
       try {
         const initial = await db.createPayment({ ...validated.value });
+        if(initial.workflow?.status==="not_required") return {status:201,body:initial};
+        // Investigation is an explicit, auditable case action, not a routine intake side effect.
+        if(initial.workflow) return {status:201,body:initial};
         let model; try { model = await runAnalysis(initial.case); } catch { model = fallbackAnalysisForCase(initial.case); }
         const recommendation = recommendRoute(initial.case, model);
         await db.saveAnalysis(initial.case.id, model.provider || 'policy_fallback', model, initial.case.triage);
@@ -172,7 +229,7 @@ export function createApiDispatcher({ db, env = process.env, analyzer, sessions 
       if (!isAdmin) return { status: 401, body: { error: 'Admin login required.' } };
       const limit=Math.min(200,Math.max(1,Number.parseInt(url.searchParams.get('limit')||'100',10)||100));
       const offset=Math.max(0,Number.parseInt(url.searchParams.get('offset')||'0',10)||0);
-      return { status:200, body:await db.listPayments({route:url.searchParams.get('route')||undefined,status:url.searchParams.get('status')||undefined,query:(url.searchParams.get('q')||'').slice(0,100),limit,offset}) };
+      return { status:200, body:await db.listPayments({route:url.searchParams.get('route')||undefined,status:url.searchParams.get('status')||undefined,query:(url.searchParams.get('q')||'').slice(0,100),guided:url.searchParams.get('guided')==='1',limit,offset}) };
     }
     const pm=pathname.match(/^\/api\/payments\/([^/]+)(?:\/(message|decision|verify|analyze))?$/);
     if(pm){
@@ -181,6 +238,7 @@ export function createApiDispatcher({ db, env = process.env, analyzer, sessions 
       if(method!=='POST')return {status:405,body:{error:'Method not allowed.'}};
       if(!isAdmin)return {status:401,body:{error:'Admin login required.'}};
       if(action==='analyze'){
+        if(payment.workflow?.status==='not_required')return {status:409,body:{error:'No exception was detected. Investigation is not required.'}};
         let model;try{model=await runAnalysis(payment.case)}catch{model=fallbackAnalysisForCase(payment.case)}
         const recommendation=recommendRoute(payment.case,model); await db.saveAnalysis(payment.case.id,model.provider||'policy_fallback',model,payment.case.triage); return {status:200,body:await db.updateRecommendation(id,recommendation)};
       }
@@ -197,7 +255,7 @@ export function createApiDispatcher({ db, env = process.env, analyzer, sessions 
           const validationErrors = new Set([
             "An override reason is required.", "Safety hard stops cannot be overridden.",
             "Select a valid route for the override.", "A payment with an active safety stop cannot be closed.",
-            "Invalid decision.",
+            "Invalid decision.", "Read-back verification is required before closure.",
           ]);
           if (validationErrors.has(error.message)) return { status: 422, body: { error: error.message } };
           throw error;
@@ -209,7 +267,7 @@ export function createApiDispatcher({ db, env = process.env, analyzer, sessions 
       try {
         const caseCount = await db.countCases();
         const paymentCount = (await db.listPayments({ limit: 1 })).total;
-        return { status: 200, body: { ok: true, name: "CasePilot", syntheticOnly: true, workflowVersion: 3, caseCount, paymentCount, aiMode: env.GROQ_API_KEY ? "groq-enabled" : "demo-fallback", aiProvider: env.AI_PROVIDER || "groq", aiModel: env.AI_MODEL || "openai/gpt-oss-20b" } };
+        return { status: 200, body: { ok: true, name: "Accelera", syntheticOnly: true, workflowVersion: 4, caseCount, paymentCount, aiMode: env.GROQ_API_KEY ? "groq-enabled" : "offline-walkthrough", aiProvider: env.AI_PROVIDER || "groq", aiModel: env.AI_MODEL || "openai/gpt-oss-20b" } };
       } catch {
         return { status: 503, body: { ok: false, error: "Database unavailable." } };
       }
@@ -286,7 +344,9 @@ export async function createCasePilotServer({ dbPath = "data/casepilot.sqlite", 
   const dispatch = createApiDispatcher({ db, env, analyzer, sessions });
   const server = createServer(async (request, response) => {
     secureHeaders(response);
-    const url = new URL(request.url || "/", "http://localhost");
+    let url;
+    try { url = new URL(request.url || "/", "http://localhost"); }
+    catch { return sendJson(response,400,{error:"Malformed request target."}); }
     if (request.method === "OPTIONS") {
       response.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "GET, POST, OPTIONS", "access-control-allow-headers": "Content-Type, X-Admin-Token" });
       response.end();
@@ -302,7 +362,7 @@ export async function createCasePilotServer({ dbPath = "data/casepilot.sqlite", 
       } catch (error) { return sendJson(response, error.status || 500, { error: error.status ? error.message : "The request could not be completed." }); }
     }
     const cookieToken = (request.headers.cookie || "").match(/(?:^|;\s*)casepilot_session=([^;]+)/)?.[1] || "";
-    if (request.method === "GET" && ["/admin", "/transactions"].includes(url.pathname) && !sessions.has(cookieToken)) { response.writeHead(302, { location: "/login" }); response.end(); return; }
+    if (request.method === "GET" && ["/admin", "/transactions", "/overview"].includes(url.pathname) && !sessions.has(cookieToken)) { response.writeHead(302, { location: "/login?next="+encodeURIComponent(url.pathname+url.search) }); response.end(); return; }
     if (request.method === "GET" && await serveAsset(url.pathname, response)) return;
     sendJson(response, 404, { error: "Not found." });
   });
@@ -315,12 +375,12 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const app = await createCasePilotServer();
     const port = Number.parseInt(process.env.PORT || "4174", 10);
     const caseCount = await app.db.countCases();
-    app.server.listen(port, "0.0.0.0", () => {
-      console.log("CasePilot running on port " + app.server.address().port);
+    app.server.listen(port, process.env.HOST || (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1"), () => {
+      console.log("Accelera running on port " + app.server.address().port);
       console.log("Synthetic cases: " + caseCount + " | AI: " + (process.env.GROQ_API_KEY ? "Groq enabled" : "AI key required"));
     });
   } catch {
-    console.error("CasePilot startup failed. Check server configuration and database availability.");
+    console.error("Accelera startup failed. Check server configuration and database availability.");
     process.exitCode = 1;
   }
 }

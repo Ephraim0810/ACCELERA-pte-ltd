@@ -29,6 +29,8 @@ export function renderNetlifyRedirects(apiUrl) {
     "/payment /payment.html 200",
     "/transactions /transactions.html 200",
     "/admin /admin.html 200",
+    "/overview /index.html 200",
+    "/guide /guide.html 200",
     `/api/* ${parsed.origin}/api/:splat 200`,
   ];
   return `${routes.join("\n")}\n`;
