@@ -1,0 +1,7 @@
+data/*.sqlite
+data/*.sqlite-*
+.env
+node_modules/
+
+
+public/_redirects
