@@ -22,3 +22,8 @@ test("expired authority cannot execute a previously eligible proposal",()=>{
  w.source.authority.validUntil="2000-01-01T00:00:00Z";
  assert.throws(()=>transitionWorkflow(w,payment,"execute"),/no longer match|authority|evidence/i);
 });
+
+test("malformed authority expiry fails closed",()=>{
+ const w=createWorkflow(payment,"status");w.source.authority.validUntil="not-a-date";
+ const result=transitionWorkflow(w,payment,"investigate");assert.equal(result.status,"manual");
+});

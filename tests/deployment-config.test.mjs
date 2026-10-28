@@ -20,6 +20,7 @@ test("maps static app routes and proxies API routes to the Render origin", () =>
       "/admin /admin.html 200",
       "/overview /index.html 200",
       "/guide /guide.html 200",
+      "/request /request.html 200",
       "/api/* https://casepilot-api.onrender.com/api/:splat 200",
       "",
     ].join("\n"),

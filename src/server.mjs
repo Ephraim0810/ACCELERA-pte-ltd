@@ -8,6 +8,8 @@ import { createDatabase } from "./db.mjs";
 import { generateSyntheticCases, exceptionTypes } from "./seed.mjs";
 import { computeTriage, recommendRoute } from "./policy.mjs";
 import { SCENARIOS } from "./workflow.mjs";
+import { enhancedDispatcher } from "./upgrade-api.mjs";
+import { evidenceRecords, groundedAnalysis } from "./evidence.mjs";
 import { analyzeCase, fallbackAnalysisForCase, makeCustomerDraft, validateCaseInput } from "./ai.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -16,7 +18,7 @@ const MIME = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=u
 const MAX_BODY_BYTES = 200_000;
 
 function sendJson(response, status, data) {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "access-control-allow-origin": "*", "access-control-allow-methods": "GET, POST, OPTIONS", "access-control-allow-headers": "Content-Type, X-Admin-Token" });
+  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "access-control-allow-origin": "*", "access-control-allow-methods": "GET, POST, OPTIONS", "access-control-allow-headers": "Content-Type, X-Admin-Token, X-Request-Token" });
   response.end(JSON.stringify(data));
 }
 async function readJson(request) {
@@ -36,7 +38,7 @@ function secureHeaders(response) {
   response.setHeader("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
 }
 export function resolvePageAsset(pathname) {
-  const files = { "/": "login.html", "/payment": "payment.html", "/payment.html": "payment.html", "/login": "login.html", "/transactions": "transactions.html", "/admin": "admin.html", "/styles.css": "styles.css", "/app.js": "app.js", "/payment.js": "payment.js", "/login.js": "login.js", "/admin.js": "admin.js", "/management.js": "management.js", "/workspace.js": "workspace.js", "/shared.js": "shared.js", "/accelera.css": "accelera.css", "/guide.js": "guide.js", "/guide": "guide.html", "/overview": "index.html" };
+  const files = { "/": "login.html", "/payment": "payment.html", "/payment.html": "payment.html", "/login": "login.html", "/transactions": "transactions.html", "/admin": "admin.html", "/styles.css": "styles.css", "/app.js": "app.js", "/payment.js": "payment.js", "/login.js": "login.js", "/admin.js": "admin.js", "/management.js": "management.js", "/workspace.js": "workspace.js", "/shared.js": "shared.js", "/accelera.css": "accelera.css", "/guide.js": "guide.js", "/guide": "guide.html", "/overview": "index.html", "/request": "request.html", "/request.js": "request.js", "/upgrade-ui.js": "upgrade-ui.js", "/upgrade.css": "upgrade.css" };
   return files[pathname] || null;
 }
 async function serveAsset(pathname, response) {
@@ -184,20 +186,21 @@ export function createApiDispatcher({ db, env = process.env, analyzer, sessions 
       if(!body||!allowed.includes(body.action))return {status:422,body:{error:"Choose a supported workflow action."}};
       let model=null;
       if(["investigate","run_case"].includes(body.action)&&payment.workflow?.investigationRequired){
-        const current={...payment.case,workflowEvidence:payment.workflow.source};
+        const current={...payment.case,workflowEvidence:{records:evidenceRecords(payment.workflow,payment)},evidenceRecords:evidenceRecords(payment.workflow,payment)};
         if(payment.workflow.profile==="status"){
           const confirmed=Boolean(payment.workflow.source.confirmation);
           Object.assign(current,{paymentStatus:confirmed?"confirmed":"unknown",evidenceQuality:confirmed?"complete":"partial",authoritativeConflict:payment.workflow.source.conflict,evidenceSummary:confirmed?"A final synthetic confirmation is now available. Check its exact binding and current authority before the internal enquiry update.":"Final synthetic confirmation is missing. A timeout is not proof of failure; keep the case open."});
         }
         current.triage=computeTriage(current);
-        try{model=await runAnalysis(current)}catch{model=fallbackAnalysisForCase(current)}
+        try{model=context.benchmark?fallbackAnalysisForCase(current):await runAnalysis(current)}catch{model=fallbackAnalysisForCase(current)}
         if(!model||typeof model!=="object")model=fallbackAnalysisForCase(current);
+        model=groundedAnalysis(model,payment.workflow,payment);
       }
       try{
-        let result=await db.applyWorkflow(payment.id,body.action==="run_case"?"investigate":body.action,{note:typeof body.note==="string"?body.note.slice(0,500):"",analysis:model});
+        let result=await db.applyWorkflow(payment.id,body.action==="run_case"?"investigate":body.action,{note:typeof body.note==="string"?body.note.slice(0,500):"",analysis:model,actor:context.actor});
         if(body.action==="run_case"&&result.workflow.status==="ready"){
-          result=await db.applyWorkflow(payment.id,"execute");
-          if(result.workflow.status==="executed")result=await db.applyWorkflow(payment.id,"verify");
+          result=await db.applyWorkflow(payment.id,"execute",{actor:context.actor});
+          if(result.workflow.status==="executed")result=await db.applyWorkflow(payment.id,"verify",{actor:context.actor});
         }
         if(model)await db.saveAnalysis(payment.case.id,model.provider||"demo_fallback",model,payment.case.triage);
         return {status:200,body:{payment:await db.getPayment(payment.id),workflow:result.workflow}};
@@ -209,9 +212,9 @@ export function createApiDispatcher({ db, env = process.env, analyzer, sessions 
       if (validated.error) return { status: 422, body: { error: validated.error } };
       if(body.demoScenario!==undefined&&!context.scenarioAuthorised)return {status:422,body:{error:"Use the signed-in synthetic scenario controls."}};
       if(context.scenarioAuthorised){
-        const key=body.demoScenario;validated.value.demoScenario=key;
-        if(["status","false_ack","mismatched_confirmation","in_flight","allocation","missing_mandate","already_applied"].includes(key))Object.assign(validated.value,{paymentStatus:"confirmed",exceptionType:"status_mismatch",evidenceQuality:"complete",potentialImpact:"information_only",identityConcern:"none",authoritativeConflict:false,evidenceSummary:"The internal enquiry is pending. Structured mock source records are available for investigation."});
-        if(key==="waiting")Object.assign(validated.value,{paymentStatus:"unknown",exceptionType:"status_timeout",evidenceQuality:"partial",potentialImpact:"reversible_update",identityConcern:"none",evidenceSummary:"The processor request timed out. Final authoritative confirmation is missing; a timeout does not prove failure."});
+        const key=body.demoScenario;validated.value.demoScenario=key;validated.value.benchmark=Boolean(context.benchmark);
+        if(["status","false_ack","mismatched_confirmation","in_flight","allocation","missing_mandate","already_applied","risk_flag","evidence_conflict","status_changed"].includes(key))Object.assign(validated.value,{paymentStatus:"confirmed",exceptionType:"status_mismatch",evidenceQuality:"complete",potentialImpact:"information_only",identityConcern:"none",authoritativeConflict:false,evidenceSummary:"The internal enquiry is pending. Structured mock source records are available for investigation."});
+        if(["waiting","recovery"].includes(key))Object.assign(validated.value,{paymentStatus:"unknown",exceptionType:"status_timeout",evidenceQuality:"partial",potentialImpact:"reversible_update",identityConcern:"none",evidenceSummary:"The processor request timed out. Final authoritative confirmation is missing; a timeout does not prove failure."});
       }
       try {
         const initial = await db.createPayment({ ...validated.value });
@@ -267,7 +270,7 @@ export function createApiDispatcher({ db, env = process.env, analyzer, sessions 
       try {
         const caseCount = await db.countCases();
         const paymentCount = (await db.listPayments({ limit: 1 })).total;
-        return { status: 200, body: { ok: true, name: "Accelera", syntheticOnly: true, workflowVersion: 4, caseCount, paymentCount, aiMode: env.GROQ_API_KEY ? "groq-enabled" : "offline-walkthrough", aiProvider: env.AI_PROVIDER || "groq", aiModel: env.AI_MODEL || "openai/gpt-oss-20b" } };
+        return { status: 200, body: { ok: true, name: "Accelera", syntheticOnly: true, workflowVersion: 5, caseCount, paymentCount, aiMode: env.GROQ_API_KEY ? "groq-enabled" : "offline-walkthrough", aiProvider: env.AI_PROVIDER || "groq", aiModel: env.AI_MODEL || "openai/gpt-oss-20b" } };
       } catch {
         return { status: 503, body: { ok: false, error: "Database unavailable." } };
       }
@@ -341,14 +344,15 @@ export async function createCasePilotServer({ dbPath = "data/casepilot.sqlite", 
     throw new Error("Database initialization failed.");
   }
   const sessions = new Map();
-  const dispatch = createApiDispatcher({ db, env, analyzer, sessions });
+  const legacyDispatch = createApiDispatcher({ db, env, analyzer, sessions });
+  const dispatch = enhancedDispatcher({db,env,sessions,legacyDispatch});
   const server = createServer(async (request, response) => {
     secureHeaders(response);
     let url;
     try { url = new URL(request.url || "/", "http://localhost"); }
     catch { return sendJson(response,400,{error:"Malformed request target."}); }
     if (request.method === "OPTIONS") {
-      response.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "GET, POST, OPTIONS", "access-control-allow-headers": "Content-Type, X-Admin-Token" });
+      response.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "GET, POST, OPTIONS", "access-control-allow-headers": "Content-Type, X-Admin-Token, X-Request-Token" });
       response.end();
       return;
     }
@@ -357,7 +361,7 @@ export async function createCasePilotServer({ dbPath = "data/casepilot.sqlite", 
         const body = request.method === "POST" ? await readJson(request) : {};
         const cookie = request.headers.cookie || '';
         const cookieToken = cookie.match(/(?:^|;\s*)casepilot_session=([^;]+)/)?.[1] || '';
-        const result = await dispatch(request.method, url, body, { token: request.headers["x-admin-token"] || cookieToken });
+        const result = await dispatch(request.method, url, body, { token: request.headers["x-admin-token"] || cookieToken, requestToken:request.headers["x-request-token"] || "" });
         return sendJson(response, result.status, result.body);
       } catch (error) { return sendJson(response, error.status || 500, { error: error.status ? error.message : "The request could not be completed." }); }
     }
@@ -375,6 +379,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const app = await createCasePilotServer();
     const port = Number.parseInt(process.env.PORT || "4174", 10);
     const caseCount = await app.db.countCases();
+    app.server.once("error",async error=>{console.error(error.code==="EADDRINUSE"?"Accelera could not start: this port is already in use. Stop the older instance or choose another PORT.":"Accelera could not open its local listener.");await app.close();process.exitCode=1;});
     app.server.listen(port, process.env.HOST || (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1"), () => {
       console.log("Accelera running on port " + app.server.address().port);
       console.log("Synthetic cases: " + caseCount + " | AI: " + (process.env.GROQ_API_KEY ? "Groq enabled" : "AI key required"));

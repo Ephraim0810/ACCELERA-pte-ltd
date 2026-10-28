@@ -2,9 +2,10 @@ import { createClient } from "@libsql/client";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes, createHash } from "node:crypto";
 import { computeTriage } from "./policy.mjs";
-import { createWorkflow, transitionWorkflow } from "./workflow.mjs";
+import { createWorkflow, transitionWorkflow, paymentSnapshot } from "./workflow.mjs";
+import { evidenceRecords, clearMatch, challengeEvidence } from "./evidence.mjs";
 
 function parseJson(value, fallback = []) {
   try { return JSON.parse(value); } catch { return fallback; }
@@ -115,6 +116,9 @@ const schema = `
     CREATE INDEX IF NOT EXISTS idx_payments_route ON payments(route);
     CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at DESC);
     CREATE TABLE IF NOT EXISTS payment_workflows (payment_id TEXT PRIMARY KEY REFERENCES payments(id), state_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS recovery_requests (id TEXT PRIMARY KEY,payment_id TEXT NOT NULL REFERENCES payments(id),recipient TEXT NOT NULL,status TEXT NOT NULL,required_json TEXT NOT NULL,token_hash TEXT NOT NULL,binding_hash TEXT NOT NULL,accepted_hash TEXT,created_at TEXT NOT NULL,expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS recovery_responses (id TEXT PRIMARY KEY,request_id TEXT NOT NULL REFERENCES recovery_requests(id),payload_json TEXT NOT NULL,validation_json TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS benchmark_runs (id TEXT PRIMARY KEY,data_json TEXT NOT NULL,created_at TEXT NOT NULL);
   `;
 const insertCaseSql = `
     INSERT INTO cases (
@@ -289,6 +293,7 @@ export async function createDatabase({ env = process.env, path = "data/casepilot
           created.reviewStatus, created.now, created.now]);
       await run(tx, "UPDATE cases SET route = ? WHERE id = ?", [route, created.id]);
       const workflow = createWorkflow({id:created.id,...input,case:{...input}}, input.demoScenario);
+      if(input.benchmark)workflow.isBenchmark=true;
       await run(tx, "INSERT INTO payment_workflows (payment_id,state_json) VALUES (?,?)", [created.id,JSON.stringify(workflow)]);
       return created;
     });
@@ -349,7 +354,7 @@ export async function createDatabase({ env = process.env, path = "data/casepilot
   }
   async function listPayments({ route, status, query, guided = false, limit = 100, offset = 0 } = {}) {
     const where = [], params = [];
-    if (guided) where.push("EXISTS (SELECT 1 FROM payment_workflows wf WHERE wf.payment_id=p.id)");
+    if (guided) where.push("EXISTS (SELECT 1 FROM payment_workflows wf WHERE wf.payment_id=p.id AND COALESCE(json_extract(wf.state_json,'$.isBenchmark'),0)=0)");
     if (route && route !== "all") { where.push("p.route=?"); params.push(route); }
     if (status && status !== "all") {
       if (status === "pending") where.push("p.payment_status IN ('unknown','processing')");
@@ -418,28 +423,36 @@ export async function createDatabase({ env = process.env, path = "data/casepilot
     return {verified,resolved:verified,actionRecorded:["reviewed","closed","escalated","awaiting_information"].includes(p.workflowStatus),issues,payment:await getPayment(paymentId)};
   }
   async function applyWorkflow(paymentId,action,details={}) {
+    let blocked;
     await write(async tx=>{
       const row=await one(tx,"SELECT * FROM payments WHERE id=?",[paymentId]);
       const saved=await one(tx,"SELECT state_json FROM payment_workflows WHERE payment_id=?",[paymentId]);
       if(!row||!saved)throw Object.assign(new Error("No guided workflow exists for this payment."),{status:404});
-      const current=parseJson(saved.state_json,null);
-      const record=mapPayment(row,null,current);
-      const updated=transitionWorkflow(current,record,action,details);
+      const current=parseJson(saved.state_json,null),record=mapPayment(row,null,current);
+      let updated;
+      try{updated=transitionWorkflow(current,record,action,details);}
+      catch(error){
+        if(!error.status)throw error;
+        blocked=error;updated=structuredClone(current);updated.version++;updated.updatedAt=new Date().toISOString();
+        updated.events.push({id:randomUUID(),type:"action_blocked",actor:"System",at:updated.updatedAt,message:error.message,requestedAction:action});
+      }
+      if(action==="approve"&&updated.approval){updated.approval.actorPrincipal=details.actor?.user||"Reviewer";updated.approval.authorisationRole=details.actor?.role||"system";}
+      for(const e of updated.events.slice(current.events.length)){e.actorPrincipal=details.actor?.user||e.actor;e.authorisationRole=details.actor?.role||"system";e.previousStatus=current.status;e.resultingStatus=updated.status;}
       await run(tx,"UPDATE payment_workflows SET state_json=? WHERE payment_id=?",[JSON.stringify(updated),paymentId]);
       const status={verified:"closed",executed:"verification_pending",verification_failed:"verification_failed",waiting:"awaiting_information",manual:"escalated",review:"pending",ready:"ready",detected:"pending",not_required:"not_required"}[updated.status];
       await run(tx,"UPDATE payments SET workflow_status=?,updated_at=? WHERE id=?",[status,updated.updatedAt,paymentId]);
       await run(tx,"UPDATE cases SET review_status=?,updated_at=? WHERE id=?",[status,updated.updatedAt,row.case_id]);
-      const last=updated.events.at(-1);
-      await auditEvent(tx,row.case_id,"workflow_"+last.type,{actor:last.actor,message:last.message,workflowVersion:updated.version},updated.updatedAt);
+      const last=updated.events.at(-1);await auditEvent(tx,row.case_id,"workflow_"+last.type,{actor:last.actor,principal:last.actorPrincipal,message:last.message,previousStatus:current.status,resultingStatus:updated.status,workflowVersion:updated.version},updated.updatedAt);
     });
+    if(blocked)throw blocked;
     return getPayment(paymentId);
   }
   async function workflowMetrics() {
-    const states=(await rows(db,"SELECT state_json FROM payment_workflows")).map(r=>parseJson(r.state_json,null)).filter(Boolean);
+    const states=(await rows(db,"SELECT state_json FROM payment_workflows")).map(r=>parseJson(r.state_json,null)).filter(s=>s&&!s.isBenchmark);
     const exceptions=states.filter(s=>s.investigationRequired), verified=exceptions.filter(s=>s.status==="verified");
     const durations=verified.map(s=>(Date.parse(s.verification.at)-Date.parse(s.createdAt))/1000);
-    return {syntheticOnly:true,total:states.length,exceptions:exceptions.length,routine:states.filter(s=>s.status==="not_required").length,
-      verified:verified.length,waiting:exceptions.filter(s=>s.status==="waiting").length,human:exceptions.filter(s=>["manual","review"].includes(s.status)).length,
+    return {syntheticOnly:true,riskRestricted:states.filter(s=>(s.source.riskIndicators||[]).some(r=>r.active)).length,recoveryOpen:states.filter(s=>s.scenario==="recovery"&&!s.source.confirmation).length,total:states.length,exceptions:exceptions.length,routine:states.filter(s=>s.status==="not_required").length,
+      verified:verified.length,waiting:exceptions.filter(s=>s.status==="waiting").length,human:exceptions.filter(s=>["manual","review","verification_failed"].includes(s.status)).length,
       falseAcknowledgementsCaught:states.filter(s=>s.events.some(e=>e.type==="verification_failed")).length,
       duplicateWritesPrevented:states.reduce((n,s)=>n+s.events.filter(e=>["duplicate_prevented","already_applied"].includes(e.type)).length,0),
       averageObservedResolutionSeconds:durations.length?Math.round(durations.reduce((a,b)=>a+b,0)/durations.length):null,
@@ -447,6 +460,99 @@ export async function createDatabase({ env = process.env, path = "data/casepilot
       actions:states.reduce((n,s)=>n+s.attempts.filter(a=>a.status!=="unknown").length,0),
       events:states.flatMap(s=>s.events.map(e=>({...e,reference:s.protected.reference,scenario:s.scenario}))).sort((a,b)=>b.at.localeCompare(a.at))};
   }
+
+  const tokenDigest=value=>createHash("sha256").update(String(value)).digest("hex");
+  async function recoveryRequests(paymentId){
+    const found=await rows(db,"SELECT * FROM recovery_requests WHERE payment_id=? ORDER BY created_at",[paymentId]);
+    return Promise.all(found.map(async row=>({id:row.id,paymentId:row.payment_id,recipient:row.recipient,status:row.status,requiredFields:parseJson(row.required_json),createdAt:row.created_at,expiresAt:row.expires_at,
+      responses:(await rows(db,"SELECT * FROM recovery_responses WHERE request_id=? ORDER BY created_at",[row.id])).map(x=>({id:x.id,payload:parseJson(x.payload_json,{}),validation:parseJson(x.validation_json,{}),createdAt:x.created_at}))})));
+  }
+  async function createRecoveryRequest(paymentId,actor={},ttlMs=900000){
+    const p=await getPayment(paymentId),w=p?.workflow;
+    if(!w||w.scenario!=="recovery"||w.status!=="waiting"||w.source.confirmation)throw Object.assign(new Error("This case is not waiting for a processor confirmation."),{status:409});
+    const secret=randomBytes(32).toString("base64url"),now=new Date().toISOString(),expires=new Date(Date.now()+Math.max(1000,Math.min(86400000,ttlMs))).toISOString();
+    let id;
+    await write(async tx=>{
+      const active=await one(tx,"SELECT * FROM recovery_requests WHERE payment_id=? AND status='awaiting_response' ORDER BY created_at DESC LIMIT 1",[paymentId]);
+      id=active?.id||randomUUID();
+      const required=["reference","amountMinor","currency","beneficiaryAccount","finalStatus","processorRecordId"];
+      if(active)await run(tx,"UPDATE recovery_requests SET token_hash=?,expires_at=? WHERE id=?",[tokenDigest(secret),expires,id]);
+      else await run(tx,"INSERT INTO recovery_requests (id,payment_id,recipient,status,required_json,token_hash,binding_hash,created_at,expires_at) VALUES (?,?,?,'awaiting_response',?,?,?,?,?)",
+        [id,paymentId,"Mock processor operations desk",JSON.stringify(required),tokenDigest(secret),tokenDigest(JSON.stringify(w.protected)),now,expires]);
+      const current=await one(tx,"SELECT state_json FROM payment_workflows WHERE payment_id=?",[paymentId]),state=parseJson(current.state_json,null);
+      state.version++;state.updatedAt=now;state.events.push({id:randomUUID(),type:"recovery_request_created",actor:"Agent",actorPrincipal:actor.user||"operator",authorisationRole:actor.role||"administrator",at:now,previousStatus:state.status,resultingStatus:state.status,message:"A processor-confirmation request was saved for the intended mock processor desk. The scoped portal link is a local delivery simulation; no notification was sent.",requestId:id});
+      await run(tx,"UPDATE payment_workflows SET state_json=? WHERE payment_id=?",[JSON.stringify(state),paymentId]);
+      await auditEvent(tx,p.case.id,"recovery_request_created",{requestId:id,recipient:"Mock processor operations desk",actor:actor.user||"operator"},now);
+    });
+    const request=(await recoveryRequests(paymentId)).find(r=>r.id===id);
+    return {request,portalUrl:"/request?id="+encodeURIComponent(id)+"#token="+encodeURIComponent(secret)};
+  }
+  async function portalRequest(id,secret){
+    const r=await one(db,"SELECT * FROM recovery_requests WHERE id=?",[id]);
+    if(!r||!secret||tokenDigest(secret)!==r.token_hash)throw Object.assign(new Error("This request link is not authorised."),{status:403});
+    if(Date.parse(r.expires_at)<=Date.now())throw Object.assign(new Error("This request link has expired. Ask operations to issue a new link."),{status:410});
+    const payment=await getPayment(r.payment_id),request=(await recoveryRequests(r.payment_id)).find(q=>q.id===id);
+    return {request,sourceRecord:structuredClone(payment.workflow.source.processorReceipt),authorisation:{scope:"This information request only",recipient:r.recipient,expiresAt:r.expires_at}};
+  }
+  async function answerRecovery(id,secret,payload){
+    let outcome;
+    await write(async tx=>{
+      const r=await one(tx,"SELECT * FROM recovery_requests WHERE id=?",[id]);
+      if(!r||!secret||tokenDigest(secret)!==r.token_hash)throw Object.assign(new Error("This request link is not authorised."),{status:403});
+      if(Date.parse(r.expires_at)<=Date.now())throw Object.assign(new Error("This request link has expired."),{status:410});
+      const acceptedHash=tokenDigest(JSON.stringify(payload));
+      if(r.status!=="awaiting_response"){
+        if(r.accepted_hash===acceptedHash){outcome={valid:true,idempotent:true,paymentId:r.payment_id};return;}
+        throw Object.assign(new Error("This request already has an accepted response; a different response cannot replace it."),{status:409});
+      }
+      const prow=await one(tx,"SELECT * FROM payments WHERE id=?",[r.payment_id]);
+      const saved=await one(tx,"SELECT state_json FROM payment_workflows WHERE payment_id=?",[r.payment_id]),w=parseJson(saved.state_json,null),p=mapPayment(prow,null,w),receipt=w.source.processorReceipt;
+      const fields=[
+        ["reference",payload?.reference===receipt.reference],
+        ["amountMinor",Number.isSafeInteger(payload?.amountMinor)&&payload.amountMinor===receipt.amountMinor],
+        ["currency",payload?.currency===receipt.currency],
+        ["beneficiaryAccount",payload?.beneficiaryAccount===receipt.beneficiary],
+        ["finalStatus",payload?.finalStatus==="confirmed"&&receipt.finalStatus==="confirmed"],
+        ["processorRecordId",payload?.processorRecordId===receipt.id],
+        ["original instruction",r.binding_hash===tokenDigest(JSON.stringify(w.protected))&&JSON.stringify(w.protected)===JSON.stringify(paymentSnapshot(p))]
+      ];
+      const validation={valid:fields.every(([,pass])=>pass),checks:fields.map(([field,pass])=>({field,pass,reason:pass?"Matches the saved authoritative mock record.":"Missing or different from the saved mock record."})),evidenceIds:[receipt.id,"PAY-"+p.id],at:new Date().toISOString()};
+      const safePayload=Object.fromEntries(["reference","amountMinor","currency","beneficiaryAccount","finalStatus","processorRecordId"].map(k=>[k,payload?.[k]??null]));
+      await run(tx,"INSERT INTO recovery_responses (id,request_id,payload_json,validation_json,created_at) VALUES (?,?,?,?,?)",[randomUUID(),id,JSON.stringify(safePayload),JSON.stringify(validation),validation.at]);
+      let updated;
+      if(validation.valid){
+        updated=transitionWorkflow(w,p,"accept_recovery",{record:{...receipt,description:"Matching processor receipt supplied through the authorised request portal.",authoritative:true},actor:{user:r.recipient,role:"information_provider"}});
+        await run(tx,"UPDATE recovery_requests SET status='validated',accepted_hash=? WHERE id=?",[acceptedHash,id]);
+      }else{
+        updated=structuredClone(w);updated.version++;updated.updatedAt=validation.at;
+        updated.events.push({id:randomUUID(),type:"recovery_response_rejected",actor:"Information provider",actorPrincipal:r.recipient,at:validation.at,previousStatus:w.status,resultingStatus:w.status,message:"The response did not match the requested processor evidence. Failed fields: "+fields.filter(([,pass])=>!pass).map(([field])=>field).join(", ")+". No action was authorised.",requestId:id});
+      }
+      await run(tx,"UPDATE payment_workflows SET state_json=? WHERE payment_id=?",[JSON.stringify(updated),p.id]);
+      if(validation.valid){await run(tx,"UPDATE payments SET workflow_status='pending',updated_at=? WHERE id=?",[validation.at,p.id]);await run(tx,"UPDATE cases SET review_status='pending',updated_at=? WHERE id=?",[validation.at,prow.case_id]);}
+      await auditEvent(tx,prow.case_id,validation.valid?"recovery_response_validated":"recovery_response_rejected",{requestId:id,validation},validation.at);
+      outcome={valid:validation.valid,validation,paymentId:p.id,idempotent:false};
+    });
+    const p=await getPayment(outcome.paymentId);
+    return {...outcome,request:(await recoveryRequests(p.id)).find(r=>r.id===id),workflow:p.workflow,payment:p};
+  }
+  async function relatedPayments(p){
+    const matches=await rows(db,"SELECT * FROM payments WHERE id<>? AND (payer_name=? OR (beneficiary_account<>'' AND beneficiary_account=?)) ORDER BY created_at DESC LIMIT 8",[p.id,p.payerName,p.beneficiaryAccount]);
+    return matches.map(r=>mapPayment(r,null));
+  }
+  async function insight(paymentId){
+    const p=await getPayment(paymentId);if(!p?.workflow)return null;
+    const w=p.workflow,requests=await recoveryRequests(p.id),related=await relatedPayments(p);
+    return {payment:p,evidence:evidenceRecords(w,p),clearMatch:clearMatch(w,p,related),challenger:challengeEvidence(w,p),recoveryRequests:requests};
+  }
+  async function passport(paymentId){
+    const data=await insight(paymentId);if(!data)return null;
+    const {payment:p,evidence,clearMatch:matching,challenger,recoveryRequests:requests}=data,w=p.workflow;
+    const pass={schemaVersion:2,case:{id:p.id,reference:p.paymentReference,title:w.title,scenario:w.scenario,openedAt:w.createdAt,originalInstruction:paymentSnapshot(p)},investigation:{mode:w.analysisMode,summary:w.analysis?.summary||"Investigation has not run.",hypotheses:w.analysis?.hypotheses||[],claims:w.analysis?.claims||[]},evidence,clearMatch:matching,challenger,recoveryRequests:requests,proposedAction:w.proposal,safetySimulation:w.simulation||null,approvals:w.approval?[w.approval]:[],reviewerDecisions:w.reviewDecisions||[],execution:w.attempts,postExecutionVerification:w.verification,outcome:{status:w.status,question:w.question,fundsMoved:false},audit:[...w.events].sort((a,b)=>a.at.localeCompare(b.at)),scope:"Synthetic internal records only; this is not independent external-bank confirmation."};
+    return {...pass,checksum:tokenDigest(JSON.stringify(pass)),generatedAt:new Date().toISOString()};
+  }
+  async function saveBenchmark(data){await run(db,"INSERT INTO benchmark_runs (id,data_json,created_at) VALUES (?,?,?)",[data.id,JSON.stringify(data),data.createdAt]);return data;}
+  async function benchmarks(){return {items:(await rows(db,"SELECT data_json FROM benchmark_runs ORDER BY created_at DESC LIMIT 20")).map(r=>parseJson(r.data_json,{}))};}
+
   async function listCases({ route, query, status, limit = 50, offset = 0 } = {}) {
     const where = [], params = [];
     if (route && route !== "all") { where.push("route = ?"); params.push(route); }
@@ -516,6 +622,7 @@ export async function createDatabase({ env = process.env, path = "data/casepilot
     seedCases, insertCase, getCase, listCases, countCases, metrics,
     saveAnalysis, saveDraft, reviewCase, createPayment, getPayment, listPayments,
     saveMessage, decidePayment, verifyPayment, updateRecommendation, applyWorkflow, workflowMetrics,
+    recoveryRequests,createRecoveryRequest,portalRequest,answerRecovery,insight,passport,saveBenchmark,benchmarks,
     close: async () => { db.close(); },
   };
 }

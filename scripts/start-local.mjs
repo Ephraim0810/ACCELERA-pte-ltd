@@ -6,7 +6,7 @@ const root=resolve(dirname(fileURLToPath(import.meta.url)),"..");
 const port=Number(process.env.PORT||4174);
 if(!Number.isInteger(port)||port<1024||port>65535)throw Error("PORT must be an integer between 1024 and 65535.");
 const origin="http://127.0.0.1:"+port;
-async function ready(){try{const r=await fetch(origin+"/api/health",{signal:AbortSignal.timeout(650)});const d=await r.json();return r.ok&&d.name==="Accelera"&&d.workflowVersion>=4;}catch{return false;}}
+async function ready(){try{const r=await fetch(origin+"/api/health",{signal:AbortSignal.timeout(650)});const d=await r.json();return r.ok&&d.name==="Accelera"&&d.workflowVersion>=5;}catch{return false;}}
 if(!await ready()){
  mkdirSync(join(root,"data"),{recursive:true});
  const out=openSync(join(root,"data","accelera.stdout.log"),"a"),err=openSync(join(root,"data","accelera.stderr.log"),"a");

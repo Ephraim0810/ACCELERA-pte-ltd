@@ -1,6 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
+import { groundedAnalysis, challengeEvidence, clearMatch } from "./evidence.mjs";
 
 export const SCENARIOS = {
+  recovery:{title:"Recover the missing confirmation",subtitle:"Request evidence through a scoped recipient portal, validate it and resume safely.",kind:"Smart Recovery Loop",profile:"status"},
+  risk_flag:{title:"Escalate an unresolved risk restriction",subtitle:"A stored risk-monitor flag blocks automatic recovery until authorised review.",kind:"Risk exception",profile:"status"},
+  evidence_conflict:{title:"Challenge a tempting retry recommendation",subtitle:"A failed event and possible completion disagree. Programmatic checks stop the proposal.",kind:"Evidence Challenger",profile:"status"},
+  status_changed:{title:"Catch a plan overtaken by new status",subtitle:"A later status update invalidates the original action before it can execute.",kind:"SafeReplay",profile:"status"},
   normal: {title:"A payment recorded correctly", subtitle:"See why routine records bypass exception investigation.", kind:"Routine path", profile:"none"},
   status: {title:"Resolve a stale enquiry status", subtitle:"Match final confirmation, update the internal case and verify the saved result.", kind:"Automatic resolution", profile:"status"},
   waiting: {title:"Wait for the missing confirmation", subtitle:"Ask the precise question, keep the case open and resume when evidence arrives.", kind:"Evidence & resume", profile:"status"},
@@ -20,7 +25,7 @@ export function paymentSnapshot(p) {
   return {reference:p.paymentReference, customer:p.payerName||p.customerName, beneficiary:p.beneficiaryAccount||"", beneficiaryName:p.payeeName||"", country:p.bankCountry||"", amountMinor:Math.round(p.amount*100), currency:p.currency, rail:p.rail};
 }
 const bindingMatches = (e,s) => e && ["reference","customer","beneficiary","beneficiaryName","country","amountMinor","currency","rail"].every(k=>e[k]===s[k]);
-const expires = item => !item?.validUntil || Date.parse(item.validUntil) <= Date.now();
+const expires = item => !item?.validUntil || !Number.isFinite(Date.parse(item.validUntil)) || Date.parse(item.validUntil) <= Date.now();
 const split = [{invoice:"INV-101",amountMinor:200000},{invoice:"INV-102",amountMinor:50000}];
 export function createWorkflow(payment, scenario) {
   const selected = scenario || (payment.case?.exceptionType==="routine_payment" ? "normal" : payment.case?.exceptionType==="beneficiary_not_recognized" ? "unrecognised_beneficiary" : "conflict");
@@ -34,9 +39,20 @@ export function createWorkflow(payment, scenario) {
   if(selected==="waiting") { /* final confirmation is deliberately absent until the simulator delivers it */ }
   if(selected==="mismatched_confirmation") confirmation.amountMinor+=100;
   if(selected==="already_applied"){target.allocations=clone(split);target.unallocatedMinor=0;target.invoices.forEach(i=>i.outstandingMinor=0);}
+  const source={confirmation:selected==="waiting"?null:confirmation,mandate:selected==="missing_mandate"?null:mandate,authority,conflict:selected==="conflict"};
+  if(selected==="recovery"){
+    source.processorReceipt={...confirmation,id:"PROC-"+snapshot.reference,description:"Fictional processor receipt visible to the authorised recipient, not yet received by operations."};
+    source.confirmation=null;source.currentStatus="unknown";source.statusVersion=1;
+  }
+  if(selected==="risk_flag")source.riskIndicators=[{id:"RISK-"+snapshot.reference,source:"Authorised synthetic risk monitor",active:true,restriction:"no_automated_recovery",category:"unusual_beneficiary_change",description:"A synthetic beneficiary-change alert remains unresolved. This is a risk indicator, not a finding that fraud occurred.",reference:snapshot.reference,occurredAt:now}];
+  if(selected==="evidence_conflict"){
+    source.confirmation={...confirmation,finalStatus:"rejected"};
+    source.statusEvents=[{id:"FAILED-"+snapshot.reference,...snapshot,status:"rejected",authoritative:true,source:"Mock processor event log",occurredAt:now},{id:"POSSIBLE-"+snapshot.reference,...snapshot,status:"possible_completion",authoritative:true,source:"Mock settlement event log",occurredAt:now}];
+  }
+  if(selected==="status_changed"){source.currentStatus="confirmed";source.statusVersion=1;}
   return {version:1,scenario:selected,profile:meta.profile,title:meta.title,status:meta.profile==="none"?"not_required":"detected",investigationRequired:meta.profile!=="none",
     analysisMode:"not_run",analysis:null,createdAt:now,updatedAt:now,protected:snapshot,
-    source:{confirmation:selected==="waiting"?null:confirmation,mandate:selected==="missing_mandate"?null:mandate,authority,conflict:selected==="conflict"},
+    source,
     target,proposal:null,approval:null,attempts:selected==="in_flight"?[{id:randomUUID(),status:"unknown",createdAt:now}]:[],
     verification:null,question:null,takenOver:false,events:[{id:randomUUID(),type:meta.profile==="none"?"routine_recorded":"exception_detected",actor:"System",at:now,
       message:meta.profile==="none"?"Basic validation passed. The instruction was recorded. No exception investigation or model call was needed.":"A synthetic exception was detected. The payment instruction is protected; only the defined internal case action can be considered."}]};
@@ -72,11 +88,41 @@ export function workflowChecks(w,p) {
     add("Invoice split equals received amount",Boolean(m)&&m.split.length===2&&m.split.every(x=>Number.isSafeInteger(x.amountMinor)&&x.amountMinor>0)&&m.split.reduce((n,x)=>n+x.amountMinor,0)===s.amountMinor,"The authorised split must equal the received mock payment exactly.");
     add("Current balances and allocation match",already||(allocations.length===0&&w.target.unallocatedMinor===s.amountMinor&&Boolean(m)&&w.target.invoices.length===m.split.length&&w.target.invoices.every(i=>m.split.some(a=>a.invoice===i.invoice&&a.amountMinor===i.outstandingMinor))),"A partial, conflicting or duplicate allocation needs reconciliation.");
   }
+  if(w.source.currentStatus)add("Latest status remains eligible",w.source.currentStatus==="confirmed","The latest mock status is not confirmed; the previous plan cannot execute.",w.source.currentStatus==="unknown"&&!w.proposal);
+  const challenged=challengeEvidence(w,p);
+  add("Evidence Challenger supports the claims",challenged.passed,challenged.reasons.join(" "),challenged.waiting);
   return checks;
 }
 function refuse(message,status=409){throw Object.assign(new Error(message),{status});}
-export function transitionWorkflow(input,payment,action,{note="",analysis=null}={}) {
+export function transitionWorkflow(input,payment,action,{note="",analysis=null,record=null}={}) {
   const w=clone(input);w.updatedAt=new Date().toISOString();w.version++;
+  if(action==="accept_recovery"){
+    if(w.scenario!=="recovery"||w.source.confirmation)refuse("This recovery case is not awaiting a new confirmation.");
+    const received=record;
+    if(!received||!bindingMatches(received,w.protected)||received.finalStatus!=="confirmed")refuse("Validated matching processor evidence is required.");
+    w.source.confirmation=clone(received);w.source.currentStatus="confirmed";w.source.statusVersion=(w.source.statusVersion||1)+1;
+    w.analysis=null;w.analysisMode="not_run";w.proposal=null;w.approval=null;w.simulation=null;w.question=null;w.status="detected";
+    event(w,"recovery_response_validated","The scoped recipient supplied a response matching the saved processor receipt. New evidence is recorded; old proposals and approvals are invalidated.","System");return w;
+  }
+  if(action==="status_changed"){
+    if(w.scenario!=="status_changed")refuse("This simulator event is not available for the selected case.");
+    w.source.currentStatus="unknown";w.source.statusVersion=(w.source.statusVersion||1)+1;
+    event(w,"payment_status_changed","The simulator recorded a newer unconfirmed status after the proposal. SafeReplay must reject the outdated plan.","System");return w;
+  }
+  if(["reject","request_information","escalate"].includes(action)){
+    if(w.status==="not_required"||w.status==="verified")refuse("No open exception is available for this review decision.");
+    if(typeof note!=="string"||note.trim().length<8)refuse("Record a specific reason for the reviewer decision.",422);
+    w.status=action==="request_information"&&w.profile==="status"?"waiting":"manual";
+    w.question=note.trim();w.proposal=null;w.approval=null;w.takenOver=action!=="request_information";
+    w.reviewDecisions=[...(w.reviewDecisions||[]),{decision:action,note:note.trim(),at:w.updatedAt}];
+    event(w,"reviewer_"+action,note.trim(),"Reviewer");return w;
+  }
+  if(action==="simulate"){
+    if(!w.proposal||!["ready","review"].includes(w.status))refuse("Investigate a supported case before simulating its proposed correction.");
+    const checks=workflowChecks(w,payment),approvalRequired=w.profile==="allocation"&&!w.proposal.noOp&&!w.approval;
+    w.simulation={at:w.updatedAt,proposalId:w.proposal.id,context:contextOf(w,payment),before:clone(w.target),expected:clone(w.proposal.expected),checks,approvalRequired,permitted:checks.every(c=>c.pass)&&!approvalRequired&&w.proposal.context===contextOf(w,payment),fundsMoved:false};
+    event(w,"safety_simulated","SafeReplay preview compared the proposed internal change with current evidence, authority, duplicate and policy checks. No target record changed.","System");return w;
+  }
   if(action==="takeover"){
     if(w.status==="not_required"||w.status==="verified") refuse("This record has no open exception to take over.");
     w.takenOver=true;w.status="manual";w.question=w.question||"Review the linked evidence and determine the next permitted action.";
@@ -95,7 +141,8 @@ export function transitionWorkflow(input,payment,action,{note="",analysis=null}=
   }
   if(action==="investigate"){
     if(["verified","not_required","executed","verification_failed"].includes(w.status))refuse("Investigation is not available in the current state.");
-    w.analysis=analysis;w.analysisMode=analysis?.provider==="groq"?"live_ai":"offline_walkthrough";
+    w.analysis=groundedAnalysis(analysis,w,payment);w.analysisMode=analysis?.provider==="groq"?"live_ai":"offline_walkthrough";
+    w.challenger=challengeEvidence(w,payment,w.analysis);w.clearMatch=clearMatch(w,payment);
     const checks=workflowChecks(w,payment), failed=checks.filter(c=>!c.pass);
     w.checks=checks;w.proposal=null;w.approval=null;
     if(w.takenOver){w.status="manual";}
@@ -120,6 +167,7 @@ export function transitionWorkflow(input,payment,action,{note="",analysis=null}=
     if(w.status==="verified"||w.status==="executed"){event(w,"duplicate_prevented","The same action is already recorded. No second update was applied.","System");return w;}
     if(w.status!=="ready"||w.takenOver||!w.proposal)refuse("Execution is blocked. Resolve the evidence, authority or review requirement first.");
     const checks=workflowChecks(w,payment);
+    w.simulation={at:w.updatedAt,proposalId:w.proposal.id,context:contextOf(w,payment),before:clone(w.target),expected:clone(w.proposal.expected),checks,approvalRequired:false,permitted:checks.every(c=>c.pass)&&w.proposal.context===contextOf(w,payment),fundsMoved:false};
     if(checks.some(c=>!c.pass)||w.proposal.context!==contextOf(w,payment))refuse("Current records no longer match the approved proposal. Investigate again.");
     if(w.profile==="allocation"&&!w.proposal.noOp&&(!w.approval||w.approval.proposalId!==w.proposal.id||w.approval.context!==w.proposal.context))refuse("Approval for this exact allocation proposal is required.");
     if(w.proposal.noOp){w.status="executed";event(w,"already_applied","The exact expected record is already present. No write was repeated.","System");return w;}
