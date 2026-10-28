@@ -1,0 +1,1 @@
+{"name":"accelera","version":"1.0.0","private":true,"type":"module","engines":{"node":">=22"},"scripts":{"start":"node server.js"},"dependencies":{"@libsql/client":"^0.15.15","bcryptjs":"^3.0.2","dotenv":"^16.4.7","express":"^4.21.2"}}
