@@ -5,3 +5,5 @@ node_modules/
 
 
 public/_redirects
+*.db*
+*.log

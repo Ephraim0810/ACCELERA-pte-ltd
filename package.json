@@ -1,17 +1,23 @@
 {
   "name": "accelera-prototype",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/server.mjs",
-    "dev": "node --watch src/server.mjs",
-    "test": "node --test"
+    "start": "node payment-followup-demo/server.js",
+    "demo": "node payment-followup-demo/demo.js",
+    "dev": "node --watch payment-followup-demo/server.js",
+    "test": "node --test payment-followup-demo/tests/workflow.test.js",
+    "start:legacy": "node src/server.mjs",
+    "test:legacy": "node --test tests"
   },
   "engines": {
     "node": ">=22.5.0"
   },
   "dependencies": {
-    "@libsql/client": "^0.18.0"
+    "@libsql/client": "^0.18.0",
+    "express": "^4.21.2",
+    "dotenv": "^16.4.7",
+    "bcryptjs": "^3.0.2"
   }
 }
