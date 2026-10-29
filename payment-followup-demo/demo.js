@@ -1,0 +1,10 @@
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import bcrypt from 'bcryptjs';
+import { spawn } from 'node:child_process';
+if(process.env.NODE_ENV==='production')throw Error('The local demo launcher is disabled in production. Configure normal start credentials.');
+const password=crypto.randomBytes(9).toString('hex'),secret=crypto.randomBytes(32).toString('hex');
+const token=crypto.createHmac('sha256',secret).update('case-v2:EX-4821').digest('hex');
+console.log('\nACCELERA — local synthetic walkthrough\nStaff username: analyst\nStaff password: '+password+'\nBusiness case: EX-4821\nBusiness token: '+token+'\nOpen http://127.0.0.1:4174 (unless PORT is configured).\nThese are temporary local demo credentials, not banking credentials.\n');
+const child=spawn(process.execPath,[fileURLToPath(new URL('server.js',import.meta.url))],{stdio:'inherit',env:{...process.env,HOST:'127.0.0.1',STAFF_USERNAME:'analyst',STAFF_PASSWORD_HASH:await bcrypt.hash(password,10),CASE_TOKEN_SECRET:secret,TRUST_PROXY_HOPS:'0',SESSION_SECRET:crypto.randomBytes(32).toString('hex'),DATABASE_URL:'file:local-demo.db',GROQ_API_KEY:''}});
+for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>child.kill(signal));child.on('exit',code=>process.exit(code??0));

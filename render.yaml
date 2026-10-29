@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: casepilot-api
+    name: accelera-followup
     runtime: node
     plan: free
     buildCommand: npm ci
@@ -11,15 +11,15 @@ services:
         value: production
       - key: DATABASE_URL
         sync: false
-      - key: TURSO_AUTH_TOKEN
+      - key: DATABASE_AUTH_TOKEN
         sync: false
-      - key: DEMO_ADMIN_USER
+      - key: STAFF_USERNAME
+        value: analyst
+      - key: STAFF_PASSWORD_HASH
         sync: false
-      - key: DEMO_ADMIN_PASSWORD
-        sync: false
-      - key: GROQ_API_KEY
-        sync: false
-      - key: AI_PROVIDER
-        value: groq
-      - key: AI_MODEL
-        value: openai/gpt-oss-20b
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: CASE_TOKEN_SECRET
+        generateValue: true
+      - key: TRUST_PROXY_HOPS
+        value: "1"
